@@ -1,0 +1,1460 @@
+sub-chat/
+├── app/
+│   ├── api/
+│   │   ├── auth/session/route.ts
+│   │   ├── translate/route.ts          # Server-side API key protection for translation
+│   │   └── admin/moderate/route.ts     # Privileged account moderation
+│   ├── (auth)/
+│   │   ├── login/page.tsx
+│   │   └── signup/page.tsx
+│   ├── chat/
+│   │   ├── layout.tsx
+│   │   └── [chatId]/page.tsx
+│   ├── admin/
+│   │   └── page.tsx
+│   ├── globals.css                     # Dynamic CSS variables for 10 themes
+│   └── layout.tsx                      # Root layout with i18n & RTL provider
+├── components/
+│   ├── chat/
+│   │   ├── ChatArea.tsx
+│   │   ├── MessageBubble.tsx
+│   │   ├── MediaUploader.tsx
+│   │   ├── AudioRecorder.tsx
+│   │   └── CallModal.tsx               # WebRTC Voice & Video
+│   ├── sidebar/
+│   │   ├── Sidebar.tsx
+│   │   ├── ChatList.tsx
+│   │   └── StatusViewer.tsx
+│   ├── settings/
+│   │   ├── PrivacyDashboard.tsx
+│   │   └── ThemeSelector.tsx
+│   └── ui/
+│       └── BrandLogo.tsx
+├── lib/
+│   ├── crypto/
+│   │   └── e2ee.ts                     # Web Crypto API: ECDH + AES-256-GCM
+│   ├── supabase/
+│   │   ├── client.ts
+│   │   ├── server.ts
+│   │   └── middleware.ts
+│   ├── webrtc/
+│   │   └── peerConnection.ts
+│   └── i18n/
+│       ├── languages.ts                # 100+ language registry & RTL definitions
+│       └── dictionary.ts
+└── types/
+    └── database.types.ts
+-- ENABLE EXTENSIONS
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ENUMS
+CREATE TYPE user_status AS ENUM ('online', 'offline', 'away');
+CREATE TYPE privacy_scope AS ENUM ('everyone', 'contacts', 'nobody');
+CREATE TYPE message_type AS ENUM ('text', 'image', 'video', 'document', 'audio', 'call_notice');
+CREATE TYPE call_status AS ENUM ('initiated', 'ringing', 'accepted', 'declined', 'missed', 'ended');
+CREATE TYPE role_type AS ENUM ('superadmin', 'moderator', 'user');
+
+-- 1. PROFILES & ENCRYPTION IDENTITIES
+CREATE TABLE public.profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    username VARCHAR(32) UNIQUE NOT NULL,
+    full_name VARCHAR(100) NOT NULL,
+    phone_number VARCHAR(20) UNIQUE,
+    avatar_url TEXT,
+    about TEXT DEFAULT 'Hey there! I am using SUB CHAT.',
+    role role_type DEFAULT 'user',
+    preferred_language VARCHAR(10) DEFAULT 'en',
+    auto_translate BOOLEAN DEFAULT TRUE,
+    public_key TEXT, -- Public Identity Key for ECDH / E2EE
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 2. USER SETTINGS & PRIVACY
+CREATE TABLE public.user_settings (
+    user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
+    theme VARCHAR(32) DEFAULT 'black_gold',
+    custom_bubble_color VARCHAR(10),
+    last_seen_privacy privacy_scope DEFAULT 'everyone',
+    online_privacy privacy_scope DEFAULT 'everyone',
+    profile_photo_privacy privacy_scope DEFAULT 'everyone',
+    read_receipts_enabled BOOLEAN DEFAULT TRUE,
+    typing_indicators_enabled BOOLEAN DEFAULT TRUE,
+    two_factor_enabled BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. CHATS (Direct & Multi-user Groups)
+CREATE TABLE public.chats (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    is_group BOOLEAN DEFAULT FALSE,
+    group_name VARCHAR(100),
+    group_avatar TEXT,
+    group_description TEXT,
+    created_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 4. CHAT PARTICIPANTS
+CREATE TABLE public.chat_participants (
+    chat_id UUID REFERENCES public.chats(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+    is_admin BOOLEAN DEFAULT FALSE,
+    joined_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (chat_id, user_id)
+);
+
+-- 5. MESSAGES
+CREATE TABLE public.messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chat_id UUID REFERENCES public.chats(id) ON DELETE CASCADE NOT NULL,
+    sender_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL NOT NULL,
+    encrypted_payload TEXT NOT NULL,       -- Raw payload: cipher if E2EE, plain if open
+    initial_language VARCHAR(10) DEFAULT 'en',
+    iv TEXT,                                -- Base64 IV if encrypted via AES-GCM
+    is_e2ee BOOLEAN DEFAULT FALSE,
+    message_type message_type DEFAULT 'text',
+    attachment_url TEXT,
+    reply_to_id UUID REFERENCES public.messages(id) ON DELETE SET NULL,
+    is_forwarded BOOLEAN DEFAULT FALSE,
+    is_pinned BOOLEAN DEFAULT FALSE,
+    is_edited BOOLEAN DEFAULT FALSE,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 6. MESSAGE STATUS (Read Receipts)
+CREATE TABLE public.message_statuses (
+    message_id UUID REFERENCES public.messages(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+    is_delivered BOOLEAN DEFAULT FALSE,
+    delivered_at TIMESTAMPTZ,
+    is_read BOOLEAN DEFAULT FALSE,
+    read_at TIMESTAMPTZ,
+    PRIMARY KEY (message_id, user_id)
+);
+
+-- 7. MESSAGE REACTIONS
+CREATE TABLE public.message_reactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id UUID REFERENCES public.messages(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+    reaction VARCHAR(16) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (message_id, user_id)
+);
+
+-- 8. STATUS STORIES (24-Hour Expiration)
+CREATE TABLE public.statuses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+    media_url TEXT NOT NULL,
+    caption TEXT,
+    media_type VARCHAR(10) DEFAULT 'image',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '24 hours')
+);
+
+-- 9. CALL LOGS & SIGNALING RECORDS
+CREATE TABLE public.calls (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    caller_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    receiver_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    chat_id UUID REFERENCES public.chats(id) ON DELETE CASCADE,
+    status call_status DEFAULT 'initiated',
+    is_video BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    ended_at TIMESTAMPTZ
+);
+
+-- 10. SAFETY, REPORTING, & BLOCKLISTS
+CREATE TABLE public.blocked_users (
+    blocker_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+    blocked_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (blocker_id, blocked_id)
+);
+
+CREATE TABLE public.reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reporter_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    reported_user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    message_id UUID REFERENCES public.messages(id) ON DELETE SET NULL,
+    reason TEXT NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================================
+-- ROW LEVEL SECURITY (RLS) POLICIES
+-- ============================================================================
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.chats ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.chat_participants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.message_statuses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.statuses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.calls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.blocked_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reports ENABLE ROW LEVEL SECURITY;
+
+-- Profiles: Anyone authenticated can read (respecting basic lookup for chat)
+CREATE POLICY "Profiles are viewable by authenticated users"
+ON public.profiles FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY "Users can update their own profile"
+ON public.profiles FOR UPDATE TO authenticated USING (auth.uid() = id);
+
+-- Settings: Users see & modify only their own settings
+CREATE POLICY "Users can view own settings"
+ON public.user_settings FOR SELECT TO authenticated USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own settings"
+ON public.user_settings FOR UPDATE TO authenticated USING (auth.uid() = user_id);
+
+-- Chat Participants: Users can only see chats they belong to
+CREATE POLICY "Users view chats they belong to"
+ON public.chat_participants FOR SELECT TO authenticated
+USING (user_id = auth.uid());
+
+-- Chats: Viewable if authenticated user is a participant
+CREATE POLICY "Users view chats they are member of"
+ON public.chats FOR SELECT TO authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.chat_participants 
+        WHERE chat_participants.chat_id = id 
+        AND chat_participants.user_id = auth.uid()
+    )
+);
+
+-- Messages: Access permitted if participant and not blocked
+CREATE POLICY "Users can view messages in their chats"
+ON public.messages FOR SELECT TO authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.chat_participants
+        WHERE chat_participants.chat_id = messages.chat_id
+        AND chat_participants.user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Users can insert messages into their chats"
+ON public.messages FOR INSERT TO authenticated
+WITH CHECK (
+    auth.uid() = sender_id AND
+    EXISTS (
+        SELECT 1 FROM public.chat_participants
+        WHERE chat_participants.chat_id = messages.chat_id
+        AND chat_participants.user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Users can update their own messages (edit, soft delete)"
+ON public.messages FOR UPDATE TO authenticated
+USING (auth.uid() = sender_id);
+
+-- Status Stories: Only non-expired statuses from non-blocked users
+CREATE POLICY "Users can see non-expired statuses"
+ON public.statuses FOR SELECT TO authenticated
+USING (
+    expires_at > NOW() AND
+    user_id NOT IN (
+        SELECT blocker_id FROM public.blocked_users WHERE blocked_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Users can manage their own status"
+ON public.statuses FOR ALL TO authenticated
+USING (auth.uid() = user_id);
+
+-- ============================================================================
+-- AUTOMATED PROFILE PROVISIONING VIA TRIGGER
+-- ============================================================================
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger AS $$
+BEGIN
+  INSERT INTO public.profiles (id, username, full_name, phone_number, avatar_url)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'username', CONCAT('user_', SUBSTRING(NEW.id::text, 1, 8))),
+    COALESCE(NEW.raw_user_meta_data->>'full_name', 'SUB CHAT Member'),
+    NEW.phone,
+    COALESCE(NEW.raw_user_meta_data->>'avatar_url', '')
+  );
+
+  INSERT INTO public.user_settings (user_id)
+  VALUES (NEW.id);
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+// lib/crypto/e2ee.ts
+export class WebCryptoE2EE {
+  // Generate ECDH Keypair for user identity
+  static async generateIdentityKeyPair(): Promise<CryptoKeyPair> {
+    return await window.crypto.subtle.generateKey(
+      {
+        name: 'ECDH',
+        namedCurve: 'P-256',
+      },
+      true,
+      ['deriveKey', 'deriveBits']
+    );
+  }
+
+  // Export public key to base64 for database distribution
+  static async exportPublicKey(key: CryptoKey): Promise<string> {
+    const exported = await window.crypto.subtle.exportKey('raw', key);
+    return btoa(String.fromCharCode(...new Uint8Array(exported)));
+  }
+
+  // Import peer public key from base64
+  static async importPublicKey(base64Key: string): Promise<CryptoKey> {
+    const raw = Uint8Array.from(atob(base64Key), c => c.charCodeAt(0));
+    return await window.crypto.subtle.importKey(
+      'raw',
+      raw,
+      { name: 'ECDH', namedCurve: 'P-256' },
+      true,
+      []
+    );
+  }
+
+  // Derive Shared Symmetric AES-GCM Key
+  static async deriveSharedKey(privateKey: CryptoKey, peerPublicKey: CryptoKey): Promise<CryptoKey> {
+    return await window.crypto.subtle.deriveKey(
+      {
+        name: 'ECDH',
+        public: peerPublicKey,
+      },
+      privateKey,
+      {
+        name: 'AES-GCM',
+        length: 256,
+      },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  // Encrypt Message
+  static async encrypt(plainText: string, derivedKey: CryptoKey): Promise<{ cipherText: string; iv: string }> {
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(plainText);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12)); // 96-bit standard for GCM
+
+    const cipherBuffer = await window.crypto.subtle.encrypt(
+      {
+        name: 'AES-GCM',
+        iv: iv,
+      },
+      derivedKey,
+      encoded
+    );
+
+    return {
+      cipherText: btoa(String.fromCharCode(...new Uint8Array(cipherBuffer))),
+      iv: btoa(String.fromCharCode(...iv)),
+    };
+  }
+
+  // Decrypt Message
+  static async decrypt(cipherTextBase64: string, ivBase64: string, derivedKey: CryptoKey): Promise<string> {
+    const cipherRaw = Uint8Array.from(atob(cipherTextBase64), c => c.charCodeAt(0));
+    const iv = Uint8Array.from(atob(ivBase64), c => c.charCodeAt(0));
+
+    const decryptedBuffer = await window.crypto.subtle.decrypt(
+      {
+        name: 'AES-GCM',
+        iv: iv,
+      },
+      derivedKey,
+      cipherRaw
+    );
+
+    return new TextDecoder().decode(decryptedBuffer);
+  }
+}
+// app/api/translate/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+export async function POST(req: NextRequest) {
+  try {
+    const authHeader = req.headers.get('authorization');
+    if (!authHeader) {
+      return NextResponse.json({ error: 'Missing authorization context' }, { status: 401 });
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized request' }, { status: 401 });
+    }
+
+    const { text, targetLang, sourceLang } = await req.json();
+
+    if (!text || !targetLang) {
+      return NextResponse.json({ error: 'Text and Target Language are mandatory' }, { status: 400 });
+    }
+
+    // Google Cloud Translation REST API Integration
+    const apiKey = process.env.GOOGLE_TRANSLATE_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: 'Translation provider unconfigured' }, { status: 503 });
+    }
+
+    const url = `https://translation.googleapis.com/language/translate/v2?key=${apiKey}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        q: text,
+        target: targetLang,
+        source: sourceLang || undefined,
+        format: 'text',
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error?.message || 'Upstream Translation Failed');
+    }
+
+    const translatedText = data.data.translations[0].translatedText;
+    const detectedSource = data.data.translations[0].detectedSourceLanguage || sourceLang;
+
+    return NextResponse.json({
+      translatedText,
+      detectedSource,
+      success: true,
+    });
+  } catch (error: any) {
+    console.error('Translation Exception:', error.message);
+    return NextResponse.json({ error: error.message || 'Internal translation processing error' }, { status: 500 });
+  }
+}
+// lib/webrtc/peerConnection.ts
+import { RealtimeChannel } from '@supabase/supabase-js';
+
+export interface SignalData {
+  type: 'offer' | 'answer' | 'candidate';
+  payload: any;
+  senderId: string;
+}
+
+const ICE_SERVERS: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+  ],
+};
+
+export class WebRTCManager {
+  public peerConnection: RTCPeerConnection | null = null;
+  private localStream: MediaStream | null = null;
+  private channel: RealtimeChannel;
+  private currentUserId: string;
+  private onRemoteStreamCallback: (stream: MediaStream) => void;
+
+  constructor(
+    channel: RealtimeChannel,
+    currentUserId: string,
+    onRemoteStream: (stream: MediaStream) => void
+  ) {
+    this.channel = channel;
+    this.currentUserId = currentUserId;
+    this.onRemoteStreamCallback = onRemoteStream;
+    this.initSignaling();
+  }
+
+  private initSignaling() {
+    this.channel.on('broadcast', { event: 'signal' }, async ({ payload }) => {
+      const data = payload as SignalData;
+      if (data.senderId === this.currentUserId) return;
+
+      if (data.type === 'offer') {
+        await this.handleOffer(data.payload);
+      } else if (data.type === 'answer') {
+        await this.handleAnswer(data.payload);
+      } else if (data.type === 'candidate') {
+        await this.handleCandidate(data.payload);
+      }
+    });
+  }
+
+  public async startCall(isVideo: boolean): Promise<MediaStream> {
+    this.localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: isVideo,
+    });
+
+    this.createPeerConnection();
+    this.localStream.getTracks().forEach((track) => {
+      this.peerConnection!.addTrack(track, this.localStream!);
+    });
+
+    const offer = await this.peerConnection!.createOffer();
+    await this.peerConnection!.setLocalDescription(offer);
+
+    this.channel.send({
+      type: 'broadcast',
+      event: 'signal',
+      payload: {
+        type: 'offer',
+        payload: offer,
+        senderId: this.currentUserId,
+      },
+    });
+
+    return this.localStream;
+  }
+
+  private createPeerConnection() {
+    this.peerConnection = new RTCPeerConnection(ICE_SERVERS);
+
+    this.peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.channel.send({
+          type: 'broadcast',
+          event: 'signal',
+          payload: {
+            type: 'candidate',
+            payload: event.candidate,
+            senderId: this.currentUserId,
+          },
+        });
+      }
+    };
+
+    this.peerConnection.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        this.onRemoteStreamCallback(event.streams[0]);
+      }
+    };
+  }
+
+  private async handleOffer(offer: RTCSessionDescriptionInit) {
+    if (!this.peerConnection) this.createPeerConnection();
+
+    if (!this.localStream) {
+      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      this.localStream.getTracks().forEach((track) => {
+        this.peerConnection!.addTrack(track, this.localStream!);
+      });
+    }
+
+    await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await this.peerConnection!.createAnswer();
+    await this.peerConnection!.setLocalDescription(answer);
+
+    this.channel.send({
+      type: 'broadcast',
+      event: 'signal',
+      payload: {
+        type: 'answer',
+        payload: answer,
+        senderId: this.currentUserId,
+      },
+    });
+  }
+
+  private async handleAnswer(answer: RTCSessionDescriptionInit) {
+    await this.peerConnection?.setRemoteDescription(new RTCSessionDescription(answer));
+  }
+
+  private async handleCandidate(candidate: RTCIceCandidateInit) {
+    await this.peerConnection?.addIceCandidate(new RTCIceCandidate(candidate));
+  }
+
+  public endCall() {
+    this.localStream?.getTracks().forEach((t) => t.stop());
+    this.peerConnection?.close();
+    this.peerConnection = null;
+    this.localStream = null;
+  }
+}
+/* app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-primary: #0B0E14;
+    --bg-secondary: #121824;
+    --bg-tertiary: #1B2234;
+    --accent-gold: #D4AF37;
+    --accent-gold-hover: #F3CA40;
+    --text-primary: #F8FAFC;
+    --text-secondary: #94A3B8;
+    --bubble-sent: #D4AF37;
+    --bubble-sent-text: #0B0E14;
+    --bubble-received: #1B2234;
+    --bubble-received-text: #F8FAFC;
+    --border-color: #262F45;
+  }
+
+  /* WhatsApp Green */
+  [data-theme="whatsapp_green"] {
+    --bg-primary: #0C1317;
+    --bg-secondary: #111B21;
+    --bg-tertiary: #202C33;
+    --accent-gold: #00A884;
+    --accent-gold-hover: #029071;
+    --bubble-sent: #005C4B;
+    --bubble-sent-text: #E9EDEF;
+    --bubble-received: #202C33;
+    --bubble-received-text: #E9EDEF;
+    --border-color: #222E35;
+  }
+
+  /* Telegram Blue */
+  [data-theme="telegram_blue"] {
+    --bg-primary: #0E1621;
+    --bg-secondary: #17212B;
+    --bg-tertiary: #242F3D;
+    --accent-gold: #24A1DE;
+    --accent-gold-hover: #1D85B8;
+    --bubble-sent: #2B5278;
+    --bubble-sent-text: #FFFFFF;
+    --bubble-received: #182533;
+    --bubble-received-text: #F5F5F5;
+    --border-color: #242F3D;
+  }
+
+  /* Midnight Black */
+  [data-theme="midnight_black"] {
+    --bg-primary: #000000;
+    --bg-secondary: #0A0A0A;
+    --bg-tertiary: #141414;
+    --accent-gold: #E5E5E5;
+    --accent-gold-hover: #FFFFFF;
+    --bubble-sent: #262626;
+    --bubble-sent-text: #FFFFFF;
+    --bubble-received: #171717;
+    --bubble-received-text: #EEEEEE;
+    --border-color: #262626;
+  }
+
+  /* Purple Dream */
+  [data-theme="purple_dream"] {
+    --bg-primary: #0F091A;
+    --bg-secondary: #180E2B;
+    --bg-tertiary: #241442;
+    --accent-gold: #A855F7;
+    --accent-gold-hover: #9333EA;
+    --bubble-sent: #7E22CE;
+    --bubble-sent-text: #FAF5FF;
+    --bubble-received: #241442;
+    --bubble-received-text: #FAF5FF;
+    --border-color: #3B1D6E;
+  }
+
+  /* Ocean Blue */
+  [data-theme="ocean_blue"] {
+    --bg-primary: #031525;
+    --bg-secondary: #07233B;
+    --bg-tertiary: #0C3455;
+    --accent-gold: #0EA5E9;
+    --accent-gold-hover: #0284C7;
+    --bubble-sent: #0369A1;
+    --bubble-sent-text: #F0F9FF;
+    --bubble-received: #0C3455;
+    --bubble-received-text: #F0F9FF;
+    --border-color: #0F4977;
+  }
+
+  /* Sunset Orange */
+  [data-theme="sunset_orange"] {
+    --bg-primary: #1C0A00;
+    --bg-secondary: #2B1103;
+    --bg-tertiary: #3D1A07;
+    --accent-gold: #F97316;
+    --accent-gold-hover: #EA580C;
+    --bubble-sent: #C2410C;
+    --bubble-sent-text: #FFF7ED;
+    --bubble-received: #3D1A07;
+    --bubble-received-text: #FFF7ED;
+    --border-color: #592507;
+  }
+
+  /* Pink Theme */
+  [data-theme="pink_theme"] {
+    --bg-primary: #19060E;
+    --bg-secondary: #270B19;
+    --bg-tertiary: #3D1228;
+    --accent-gold: #EC4899;
+    --accent-gold-hover: #DB2777;
+    --bubble-sent: #BE185D;
+    --bubble-sent-text: #FDF2F8;
+    --bubble-received: #3D1228;
+    --bubble-received-text: #FDF2F8;
+    --border-color: #5A173A;
+  }
+
+  /* Pure White */
+  [data-theme="pure_white"] {
+    --bg-primary: #F8FAFC;
+    --bg-secondary: #FFFFFF;
+    --bg-tertiary: #F1F5F9;
+    --accent-gold: #0F172A;
+    --accent-gold-hover: #334155;
+    --text-primary: #0F172A;
+    --text-secondary: #64748B;
+    --bubble-sent: #0F172A;
+    --bubble-sent-text: #FFFFFF;
+    --bubble-received: #E2E8F0;
+    --bubble-received-text: #0F172A;
+    --border-color: #CBD5E1;
+  }
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-feature-settings: "rlig" 1, "calt" 1;
+}
+// lib/i18n/languages.ts
+export interface Language {
+  code: string;
+  name: string;
+  nativeName: string;
+  direction: 'ltr' | 'rtl';
+}
+
+export const LANGUAGES: Language[] = [
+  { code: 'en', name: 'English', nativeName: 'English', direction: 'ltr' },
+  { code: 'ur', name: 'Urdu', nativeName: 'اردو', direction: 'rtl' },
+  { code: 'ar', name: 'Arabic', nativeName: 'العربية', direction: 'rtl' },
+  { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी', direction: 'ltr' },
+  { code: 'zh', name: 'Chinese', nativeName: '中文', direction: 'ltr' },
+  { code: 'es', name: 'Spanish', nativeName: 'Español', direction: 'ltr' },
+  { code: 'fr', name: 'French', nativeName: 'Français', direction: 'ltr' },
+  { code: 'de', name: 'German', nativeName: 'Deutsch', direction: 'ltr' },
+  { code: 'ru', name: 'Russian', nativeName: 'Русский', direction: 'ltr' },
+  { code: 'fa', name: 'Persian', nativeName: 'فارسی', direction: 'rtl' },
+  { code: 'he', name: 'Hebrew', nativeName: 'עברית', direction: 'rtl' },
+  { code: 'ps', name: 'Pashto', nativeName: 'پښتو', direction: 'rtl' },
+  { code: 'tr', name: 'Turkish', nativeName: 'Türkçe', direction: 'ltr' },
+  { code: 'pt', name: 'Portuguese', nativeName: 'Português', direction: 'ltr' },
+  { code: 'bn', name: 'Bengali', nativeName: 'বাংলা', direction: 'ltr' },
+  { code: 'pa', name: 'Punjabi', nativeName: 'ਪੰਜਾਬੀ', direction: 'ltr' },
+  { code: 'id', name: 'Indonesian', nativeName: 'Bahasa Indonesia', direction: 'ltr' },
+  { code: 'ja', name: 'Japanese', nativeName: '日本語', direction: 'ltr' },
+  { code: 'ko', name: 'Korean', nativeName: '한국어', direction: 'ltr' },
+  { code: 'vi', name: 'Vietnamese', nativeName: 'Tiếng Việt', direction: 'ltr' },
+  { code: 'sw', name: 'Swahili', nativeName: 'Kiswahili', direction: 'ltr' }
+  // Expandable to complete ISO-639-1 set
+];
+
+export function getLanguageDirection(langCode: string): 'ltr' | 'rtl' {
+  const target = LANGUAGES.find((l) => l.code === langCode);
+  return target ? target.direction : 'ltr';
+}
+// components/ui/BrandLogo.tsx
+import React from 'react';
+
+export const BrandLogo: React.FC<{ size?: number; className?: string }> = ({ size = 40, className = '' }) => {
+  return (
+    <div className={`flex items-center gap-3 select-none ${className}`}>
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 100 100"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        className="transition-transform duration-300 hover:scale-105"
+      >
+        <defs>
+          <linearGradient id="goldGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor="#F5D061" />
+            <stop offset="50%" stopColor="#D4AF37" />
+            <stop offset="100%" stopColor="#AA7C11" />
+          </linearGradient>
+          <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="#D4AF37" stopOpacity="0.3" />
+            <stop offset="100%" stopColor="#D4AF37" stopOpacity="0" />
+          </radialGradient>
+        </defs>
+
+        {/* Ambient Halo */}
+        <circle cx="50" cy="50" r="48" fill="url(#halo)" />
+
+        {/* Outer Shield Geometry */}
+        <path
+          d="M50 8L85 24V50C85 71.5 50 92 50 92C50 92 15 71.5 15 50V24L50 8Z"
+          stroke="url(#goldGradient)"
+          strokeWidth="3.5"
+          fill="#0B0E14"
+          strokeLinejoin="round"
+        />
+
+        {/* Dynamic Connected Node Paths */}
+        <path
+          d="M32 46C32 37.16 39.16 30 48 30H52C60.84 30 68 37.16 68 46C68 54.84 60.84 62 52 62H40L30 70V58C31.2 55 32 50.8 32 46Z"
+          fill="url(#goldGradient)"
+          fillOpacity="0.15"
+          stroke="url(#goldGradient)"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+
+        {/* Central International Grid Intersect */}
+        <circle cx="44" cy="46" r="3" fill="#D4AF37" />
+        <circle cx="56" cy="46" r="3" fill="#D4AF37" />
+        <path d="M42 54C46 56.5 54 56.5 58 54" stroke="#D4AF37" strokeWidth="2" strokeLinecap="round" />
+      </svg>
+      <div>
+        <span className="font-extrabold tracking-wider text-xl block leading-none text-transparent bg-clip-text bg-gradient-to-r from-[#F5D061] via-[#D4AF37] to-[#AA7C11]">
+          SUB CHAT
+        </span>
+        <span className="text-[9px] uppercase tracking-widest text-[#94A3B8] block mt-1">
+          Worldwide
+        </span>
+      </div>
+    </div>
+  );
+};
+// components/chat/MessageBubble.tsx
+'use client';
+
+import React, { useState } from 'react';
+import { Check, CheckCheck, Globe, RefreshCw, Pin, Star, Smile } from 'lucide-react';
+
+export interface MessageProps {
+  id: string;
+  senderId: string;
+  currentUserId: string;
+  payload: string;
+  initialLanguage: string;
+  userPreferredLang: string;
+  messageType: 'text' | 'image' | 'video' | 'document' | 'audio';
+  attachmentUrl?: string;
+  createdAt: string;
+  isRead: boolean;
+  isDelivered: boolean;
+  onReact: (messageId: string, emoji: string) => void;
+  onPin: (messageId: string) => void;
+}
+
+export const MessageBubble: React.FC<MessageProps> = ({
+  id,
+  senderId,
+  currentUserId,
+  payload,
+  initialLanguage,
+  userPreferredLang,
+  messageType,
+  attachmentUrl,
+  createdAt,
+  isRead,
+  isDelivered,
+  onReact,
+  onPin,
+}) => {
+  const isMine = senderId === currentUserId;
+  const [displayedText, setDisplayedText] = useState<string>(payload);
+  const [isTranslated, setIsTranslated] = useState<boolean>(false);
+  const [isTranslating, setIsTranslating] = useState<boolean>(false);
+  const [showReactions, setShowReactions] = useState<boolean>(false);
+
+  const handleTranslate = async () => {
+    if (isTranslated) {
+      setDisplayedText(payload);
+      setIsTranslated(false);
+      return;
+    }
+
+    try {
+      setIsTranslating(true);
+      const res = await fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: payload,
+          targetLang: userPreferredLang,
+          sourceLang: initialLanguage,
+        }),
+      });
+
+      const json = await res.json();
+      if (json.translatedText) {
+        setDisplayedText(json.translatedText);
+        setIsTranslated(true);
+      }
+    } catch (err) {
+      console.error('Translation failed:', err);
+    } finally {
+      setIsTranslating(false);
+    }
+  };
+
+  return (
+    <div className={`flex w-full my-1.5 ${isMine ? 'justify-end' : 'justify-start'} group`}>
+      <div
+        className={`relative max-w-[85%] md:max-w-[65%] rounded-2xl px-4 py-2.5 transition-all shadow-sm ${
+          isMine
+            ? 'bg-[var(--bubble-sent)] text-[var(--bubble-sent-text)] rounded-br-xs'
+            : 'bg-[var(--bubble-received)] text-[var(--bubble-received-text)] rounded-bl-xs border border-[var(--border-color)]'
+        }`}
+      >
+        {/* Media Layout Handlers */}
+        {messageType === 'image' && attachmentUrl && (
+          <div className="mb-2 overflow-hidden rounded-lg">
+            <img src={attachmentUrl} alt="Payload Image" className="object-cover max-h-72 w-full hover:scale-102 transition-transform" />
+          </div>
+        )}
+
+        {messageType === 'audio' && attachmentUrl && (
+          <div className="my-2 min-w-[240px]">
+            <audio controls className="w-full h-8">
+              <source src={attachmentUrl} type="audio/mpeg" />
+              Your browser does not support audio playback.
+            </audio>
+          </div>
+        )}
+
+        {/* Message Content */}
+        <p className="text-sm md:text-base font-normal leading-relaxed break-words whitespace-pre-wrap">
+          {displayedText}
+        </p>
+
+        {/* Translation Status Badge */}
+        {isTranslated && (
+          <span className="text-[10px] tracking-wide uppercase opacity-75 mt-1 block italic">
+            Translated ({initialLanguage.toUpperCase()} → {userPreferredLang.toUpperCase()})
+          </span>
+        )}
+
+        {/* Meta Bar: Timestamp, Status, Action Controls */}
+        <div className="flex items-center justify-end gap-1.5 mt-1 opacity-70 text-[11px] select-none">
+          <span>{new Date(createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+
+          {isMine && (
+            <span>
+              {isRead ? (
+                <CheckCheck size={14} className="text-sky-400 inline" />
+              ) : isDelivered ? (
+                <CheckCheck size={14} className="inline" />
+              ) : (
+                <Check size={14} className="inline" />
+              )}
+            </span>
+          )}
+        </div>
+
+        {/* Hover Action Menu */}
+        <div
+          className={`absolute top-0 transform -translate-y-1/2 hidden group-hover:flex items-center gap-1 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-full px-2 py-0.5 shadow-md ${
+            isMine ? 'left-0 -translate-x-full' : 'right-0 translate-x-full'
+          }`}
+        >
+          {messageType === 'text' && (
+            <button
+              onClick={handleTranslate}
+              disabled={isTranslating}
+              title="Translate Message"
+              className="p-1 hover:text-[var(--accent-gold)] text-[var(--text-secondary)] transition-colors"
+            >
+              {isTranslating ? <RefreshCw size={13} className="animate-spin" /> : <Globe size={13} />}
+            </button>
+          )}
+
+          <button
+            onClick={() => onPin(id)}
+            title="Pin Message"
+            className="p-1 hover:text-[var(--accent-gold)] text-[var(--text-secondary)] transition-colors"
+          >
+            <Pin size={13} />
+          </button>
+
+          <button
+            onClick={() => setShowReactions(!showReactions)}
+            title="Add Reaction"
+            className="p-1 hover:text-[var(--accent-gold)] text-[var(--text-secondary)] transition-colors"
+          >
+            <Smile size={13} />
+          </button>
+        </div>
+
+        {/* Quick Reaction Tray */}
+        {showReactions && (
+          <div className="absolute z-20 -bottom-9 left-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-full flex gap-1 p-1 shadow-lg">
+            {['❤️', '👍', '🔥', '😂', '😮', '🙏'].map((emoji) => (
+              <button
+                key={emoji}
+                onClick={() => {
+                  onReact(id, emoji);
+                  setShowReactions(false);
+                }}
+                className="hover:scale-125 px-1 transition-transform"
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+// components/chat/ChatArea.tsx
+'use client';
+
+import React, { useState, useEffect, useRef } from 'react';
+import { createClient } from '@/lib/supabase/client';
+import { MessageBubble } from './MessageBubble';
+import { Send, Paperclip, Mic, Phone, Video, MoreVertical, Shield } from 'lucide-react';
+import { WebRTCManager } from '@/lib/webrtc/peerConnection';
+
+interface ChatAreaProps {
+  chatId: string;
+  currentUser: { id: string; preferred_language: string };
+  recipient: { id: string; full_name: string; avatar_url: string; online: boolean; last_seen?: string };
+}
+
+export const ChatArea: React.FC<ChatAreaProps> = ({ chatId, currentUser, recipient }) => {
+  const supabase = createClient();
+  const [messages, setMessages] = useState<any[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [activeCall, setActiveCall] = useState<'audio' | 'video' | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+
+  const rtcManagerRef = useRef<WebRTCManager | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // 1. Initial Load & Supabase Realtime Subscription
+  useEffect(() => {
+    const fetchMessages = async () => {
+      const { data } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('chat_id', chatId)
+        .order('created_at', { ascending: true });
+      if (data) setMessages(data);
+    };
+
+    fetchMessages();
+
+    const channel = supabase.channel(`chat:${chatId}`, {
+      config: { presence: { key: currentUser.id } },
+    });
+
+    channel
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` },
+        (payload) => {
+          setMessages((prev) => [...prev, payload.new]);
+        }
+      )
+      .on('broadcast', { event: 'typing' }, ({ payload }) => {
+        if (payload.userId !== currentUser.id) {
+          setIsTyping(payload.typing);
+        }
+      })
+      .subscribe();
+
+    rtcManagerRef.current = new WebRTCManager(channel, currentUser.id, (stream) => {
+      setRemoteStream(stream);
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream;
+      }
+    });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [chatId]);
+
+  // Scroll to bottom on message updates
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isTyping]);
+
+  // 2. Dispatch Text Message
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim()) return;
+
+    const payload = inputText;
+    setInputText('');
+
+    await supabase.from('messages').insert({
+      chat_id: chatId,
+      sender_id: currentUser.id,
+      encrypted_payload: payload,
+      initial_language: currentUser.preferred_language,
+      message_type: 'text',
+    });
+  };
+
+  // 3. Initiate Call
+  const startCall = async (isVideo: boolean) => {
+    setActiveCall(isVideo ? 'video' : 'audio');
+    await rtcManagerRef.current?.startCall(isVideo);
+  };
+
+  const endCall = () => {
+    rtcManagerRef.current?.endCall();
+    setActiveCall(null);
+    setRemoteStream(null);
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-[var(--bg-primary)] overflow-hidden relative">
+      {/* Call Overlay Interface */}
+      {activeCall && (
+        <div className="absolute inset-0 z-50 bg-[#0B0E14]/90 backdrop-blur-md flex flex-col items-center justify-center p-6">
+          <div className="relative w-full max-w-2xl bg-black rounded-3xl overflow-hidden shadow-2xl border border-[var(--border-color)] aspect-video flex items-center justify-center">
+            {activeCall === 'video' ? (
+              <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
+            ) : (
+              <div className="flex flex-col items-center gap-4">
+                <img src={recipient.avatar_url} className="w-24 h-24 rounded-full border-4 border-[var(--accent-gold)] animate-pulse" />
+                <h3 className="text-xl font-bold">{recipient.full_name}</h3>
+                <span className="text-[var(--text-secondary)]">Audio Calling...</span>
+              </div>
+            )}
+          </div>
+          <div className="mt-6 flex items-center gap-4">
+            <button onClick={endCall} className="bg-red-600 hover:bg-red-700 text-white font-semibold px-6 py-3 rounded-full transition-transform hover:scale-105">
+              End Call
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Chat Header */}
+      <div className="h-16 px-6 bg-[var(--bg-secondary)] border-b border-[var(--border-color)] flex items-center justify-between z-10">
+        <div className="flex items-center gap-3">
+          <div className="relative">
+            <img src={recipient.avatar_url || '/placeholder.png'} className="w-10 h-10 rounded-full object-cover border border-[var(--border-color)]" />
+            {recipient.online && <span className="absolute bottom-0 right-0 w-3 h-3 bg-emerald-500 rounded-full ring-2 ring-[var(--bg-secondary)]" />}
+          </div>
+          <div>
+            <h2 className="font-semibold text-sm leading-tight">{recipient.full_name}</h2>
+            <span className="text-[11px] text-[var(--text-secondary)]">
+              {recipient.online ? 'Online' : recipient.last_seen || 'Offline'}
+            </span>
+          </div>
+        </div>
+
+        {/* Direct Action Hub */}
+        <div className="flex items-center gap-2">
+          <button onClick={() => startCall(false)} className="p-2.5 rounded-full hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent-gold)]">
+            <Phone size={18} />
+          </button>
+          <button onClick={() => startCall(true)} className="p-2.5 rounded-full hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent-gold)]">
+            <Video size={18} />
+          </button>
+          <button className="p-2.5 rounded-full hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+            <MoreVertical size={18} />
+          </button>
+        </div>
+      </div>
+
+      {/* Message Feed Canvas */}
+      <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col justify-start">
+        {messages.map((msg) => (
+          <MessageBubble
+            key={msg.id}
+            id={msg.id}
+            senderId={msg.sender_id}
+            currentUserId={currentUser.id}
+            payload={msg.encrypted_payload}
+            initialLanguage={msg.initial_language}
+            userPreferredLang={currentUser.preferred_language}
+            messageType={msg.message_type}
+            attachmentUrl={msg.attachment_url}
+            createdAt={msg.created_at}
+            isRead={true}
+            isDelivered={true}
+            onReact={() => {}}
+            onPin={() => {}}
+          />
+        ))}
+        {isTyping && (
+          <div className="text-[12px] italic text-[var(--text-secondary)] mt-2">
+            {recipient.full_name} is typing...
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Chat Input Console */}
+      <form onSubmit={handleSendMessage} className="p-3 bg-[var(--bg-secondary)] border-t border-[var(--border-color)] flex items-center gap-3">
+        <button type="button" className="p-2 rounded-full hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent-gold)]">
+          <Paperclip size={20} />
+        </button>
+
+        <input
+          type="text"
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          placeholder="Write a message in any language..."
+          className="flex-1 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-xl px-4 py-2.5 text-sm outline-none focus:border-[var(--accent-gold)] transition-colors"
+        />
+
+        <button type="submit" className="p-2.5 rounded-xl bg-gradient-to-r from-[#F5D061] to-[#AA7C11] text-[#0B0E14] hover:opacity-95 shadow-md">
+          <Send size={18} />
+        </button>
+      </form>
+    </div>
+  );
+};
+// components/settings/PrivacyDashboard.tsx
+'use client';
+
+import React, { useState } from 'react';
+import { createClient } from '@/lib/supabase/client';
+import { Shield, Lock, Eye, BellOff, UserX, KeyRound, Trash2 } from 'lucide-react';
+
+export const PrivacyDashboard: React.FC<{ initialSettings: any; userId: string }> = ({
+  initialSettings,
+  userId,
+}) => {
+  const supabase = createClient();
+  const [settings, setSettings] = useState(initialSettings);
+  const [saving, setSaving] = useState(false);
+
+  const updateSetting = async (key: string, value: any) => {
+    setSaving(true);
+    const updated = { ...settings, [key]: value };
+    setSettings(updated);
+
+    await supabase
+      .from('user_settings')
+      .update({ [key]: value, updated_at: new Date().toISOString() })
+      .eq('user_id', userId);
+
+    setSaving(false);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 space-y-8 bg-[var(--bg-primary)]">
+      <div className="border-b border-[var(--border-color)] pb-4">
+        <h1 className="text-2xl font-bold flex items-center gap-3 text-[var(--accent-gold)]">
+          <Shield size={28} /> Advanced Privacy & Confidentiality Hub
+        </h1>
+        <p className="text-sm text-[var(--text-secondary)] mt-1">
+          Manage identity parameters, cryptographic authorizations, and presence propagation.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Presence Policies */}
+        <div className="p-5 rounded-2xl bg-[var(--bg-secondary)] border border-[var(--border-color)] space-y-4">
+          <h2 className="font-semibold text-base flex items-center gap-2">
+            <Eye size={18} className="text-[var(--accent-gold)]" /> Visibility & Presence
+          </h2>
+
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-[var(--text-secondary)]">Who can see my Last Seen</label>
+              <select
+                value={settings.last_seen_privacy}
+                onChange={(e) => updateSetting('last_seen_privacy', e.target.value)}
+                className="w-full mt-1 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-lg p-2.5 text-sm"
+              >
+                <option value="everyone">Everyone Worldwide</option>
+                <option value="contacts">My Contacts Only</option>
+                <option value="nobody">Nobody</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="text-xs text-[var(--text-secondary)]">Who can see my Profile Picture</label>
+              <select
+                value={settings.profile_photo_privacy}
+                onChange={(e) => updateSetting('profile_photo_privacy', e.target.value)}
+                className="w-full mt-1 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-lg p-2.5 text-sm"
+              >
+                <option value="everyone">Everyone</option>
+                <option value="contacts">Contacts</option>
+                <option value="nobody">Nobody</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Messaging Safeguards */}
+        <div className="p-5 rounded-2xl bg-[var(--bg-secondary)] border border-[var(--border-color)] space-y-4">
+          <h2 className="font-semibold text-base flex items-center gap-2">
+            <Lock size={18} className="text-[var(--accent-gold)]" /> Realtime Transmission
+          </h2>
+
+          <div className="space-y-4 pt-2">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Read Receipts</div>
+                <div className="text-[11px] text-[var(--text-secondary)]">If disabled, you will neither send nor view read notices.</div>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.read_receipts_enabled}
+                onChange={(e) => updateSetting('read_receipts_enabled', e.target.checked)}
+                className="h-5 w-5 accent-[var(--accent-gold)] rounded cursor-pointer"
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Typing Broadcasts</div>
+                <div className="text-[11px] text-[var(--text-secondary)]">Relay active keyboard interaction indicators.</div>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.typing_indicators_enabled}
+                onChange={(e) => updateSetting('typing_indicators_enabled', e.target.checked)}
+                className="h-5 w-5 accent-[var(--accent-gold)] rounded cursor-pointer"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Destructive / Security Actions */}
+      <div className="p-5 rounded-2xl bg-red-950/20 border border-red-900/50 flex flex-col md:flex-row items-center justify-between gap-4">
+        <div>
+          <h3 className="text-red-400 font-semibold text-sm">Delete Account & Destroy Cryptographic Identities</h3>
+          <p className="text-[11px] text-red-300/80">Permanent purge of all message payloads, sessions, and associated identities.</p>
+        </div>
+        <button className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-colors">
+          <Trash2 size={14} /> Purge Account
+        </button>
+      </div>
+    </div>
+  );
+};
+// app/admin/page.tsx
+import { createClient } from '@/lib/supabase/server';
+import { redirect } from 'next/navigation';
+import { ShieldCheck, UserX, AlertTriangle, Users } from 'lucide-react';
+
+export default async function AdminDashboardPage() {
+  const supabase = createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) return redirect('/login');
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .single();
+
+  if (!profile || (profile.role !== 'superadmin' && profile.role !== 'moderator')) {
+    return (
+      <div className="h-screen flex items-center justify-center text-red-500 font-semibold bg-black">
+        Access Denied: Insufficient Clearance Privileges.
+      </div>
+    );
+  }
+
+  // Analytics Aggregation
+  const [{ count: totalUsers }, { count: totalReports }, { count: totalChats }] = await Promise.all([
+    supabase.from('profiles').select('*', { count: 'exact', head: true }),
+    supabase.from('reports').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+    supabase.from('chats').select('*', { count: 'exact', head: true }),
+  ]);
+
+  const { data: pendingReports } = await supabase
+    .from('reports')
+    .select('*, reporter:reporter_id(username), reported:reported_user_id(username)')
+    .eq('status', 'pending')
+    .limit(10);
+
+  return (
+    <div className="min-h-screen bg-[#0B0E14] text-[#F8FAFC] p-8">
+      <div className="max-w-7xl mx-auto space-y-8">
+        <div className="flex items-center justify-between border-b border-[#262F45] pb-6">
+          <div className="flex items-center gap-3">
+            <ShieldCheck size={36} className="text-[#D4AF37]" />
+            <div>
+              <h1 className="text-2xl font-bold">SUB CHAT Administration</h1>
+              <p className="text-xs text-[#94A3B8]">Worldwide Operational & Trust Management Console</p>
+            </div>
+          </div>
+        </div>
+
+        {/* Global Performance Telemetry Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="bg-[#121824] border border-[#262F45] p-5 rounded-2xl">
+            <div className="flex items-center gap-3 text-[#94A3B8]">
+              <Users size={18} />
+              <span className="text-sm">Total Members</span>
+            </div>
+            <div className="text-3xl font-extrabold mt-2 text-[#D4AF37]">{totalUsers || 0}</div>
+          </div>
+
+          <div className="bg-[#121824] border border-[#262F45] p-5 rounded-2xl">
+            <div className="flex items-center gap-3 text-[#94A3B8]">
+              <AlertTriangle size={18} />
+              <span className="text-sm">Pending Infraction Reports</span>
+            </div>
+            <div className="text-3xl font-extrabold mt-2 text-rose-500">{totalReports || 0}</div>
+          </div>
+
+          <div className="bg-[#121824] border border-[#262F45] p-5 rounded-2xl">
+            <div className="flex items-center gap-3 text-[#94A3B8]">
+              <ShieldCheck size={18} />
+              <span className="text-sm">Active Worldwide Channels</span>
+            </div>
+            <div className="text-3xl font-extrabold mt-2 text-emerald-400">{totalChats || 0}</div>
+          </div>
+        </div>
+
+        {/* Infraction Resolution Feed */}
+        <div className="bg-[#121824] border border-[#262F45] rounded-2xl p-6">
+          <h2 className="text-lg font-semibold mb-4 text-[#D4AF37]">Pending Moderation Reports</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-[#262F45] text-[#94A3B8]">
+                <tr>
+                  <th className="pb-3">Reporter</th>
+                  <th className="pb-3">Target Profile</th>
+                  <th className="pb-3">Alleged Violation</th>
+                  <th className="pb-3 text-right">Moderation Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#262F45]">
+                {pendingReports?.map((r: any) => (
+                  <tr key={r.id}>
+                    <td className="py-4 font-mono text-xs text-[#D4AF37]">@{r.reporter?.username}</td>
+                    <td className="py-4 font-mono text-xs text-rose-400">@{r.reported?.username}</td>
+                    <td className="py-4 text-[#94A3B8]">{r.reason}</td>
+                    <td className="py-4 text-right space-x-2">
+                      <button className="px-3 py-1 bg-red-600/20 text-red-400 border border-red-500/30 rounded-lg hover:bg-red-600/40 text-xs">
+                        Ban User
+                      </button>
+                      <button className="px-3 py-1 bg-[#1B2234] text-[#94A3B8] rounded-lg hover:bg-[#262F45] text-xs">
+                        Dismiss
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
